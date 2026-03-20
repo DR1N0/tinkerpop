@@ -681,7 +681,52 @@ func bindingWriter(value interface{}, buffer *bytes.Buffer, typeSerializer *grap
 	return buffer.Bytes(), nil
 }
 
+// customTypeWriter handles serialization of custom types registered via RegisterCustomTypeWriter.
+// Format: {type_code}{type_info}{value_flag}{value}
+// where type_code=0x00 (customType), type_info is the custom type name length+bytes,
+// value_flag=0x00 (not null), and value is the custom-serialized data.
+func customTypeWriter(value interface{}, buffer *bytes.Buffer, typeSerializer *graphBinaryTypeSerializer) ([]byte, error) {
+	// Look up the custom type info
+	valType := reflect.TypeOf(value)
+	customTypeWriterLock.RLock()
+	typeInfo, exists := customSerializers[valType]
+	customTypeWriterLock.RUnlock()
+
+	if !exists || customSerializers == nil {
+		return nil, newError(err0407GetSerializerToWriteUnknownTypeError, valType.Name())
+	}
+
+	// Write the custom type name as a String (length prefix + UTF-8 bytes)
+	typeName := typeInfo.TypeName
+	typeNameBytes := []byte(typeName)
+	if err := binary.Write(buffer, binary.BigEndian, int32(len(typeNameBytes))); err != nil {
+		return nil, err
+	}
+	if _, err := buffer.Write(typeNameBytes); err != nil {
+		return nil, err
+	}
+
+	// Call the custom writer to serialize the value
+	if err := typeInfo.Writer(value, buffer); err != nil {
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
 func (serializer *graphBinaryTypeSerializer) getType(val interface{}) (dataType, error) {
+	// Check if this is a registered custom type
+	valType := reflect.TypeOf(val)
+	customTypeWriterLock.RLock()
+	var isCustomType bool
+	if customSerializers != nil {
+		_, isCustomType = customSerializers[valType]
+	}
+	customTypeWriterLock.RUnlock()
+	if isCustomType {
+		return customType, nil
+	}
+
 	switch val.(type) {
 	case *Bytecode, Bytecode, *GraphTraversal:
 		return bytecodeType, nil
@@ -816,6 +861,13 @@ func (serializer *graphBinaryTypeSerializer) write(valueObject interface{}, buff
 		return nil, err
 	}
 	buffer.Write(dataType.getCodeBytes())
+	if dataType == customType {
+		// Custom type format: {type_code=0x00}{type_name_string}{value_flag}{value}
+		// The type_name immediately follows type_code with NO value_flag in between.
+		// writeType would insert an extra value_flag byte that shifts the type_name
+		// string, causing the server to compute the wrong string length → PROCESSING_ERROR.
+		return writer(valueObject, buffer, serializer)
+	}
 	return serializer.writeType(valueObject, buffer, writer)
 }
 
